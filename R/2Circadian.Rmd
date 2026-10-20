@@ -1,0 +1,200 @@
+---
+title: "Circadian"
+author: "senthil"
+date: "2026-06-11"
+output: html_document
+---
+
+Libraries
+```{r}
+
+#for mefisto
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+
+
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+library(patchwork)
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+library(ggplot2)
+library(patchwork)
+library(stringr)
+```
+
+```{r load-raw}
+
+circ <- readRDS( "circadian_mouse_zhang_microarray.rds" ) 
+pData(circ)$sample <- colnames(circ)
+pData(circ)$tissue_type <- factor( pData(circ)$tissue_type )
+
+fdata <- fData(circ)
+Y_raw <- exprs(circ)
+xdata <- pData(circ)
+zdata <- xdata
+```
+
+# Define SVDX formulas
+```{r formulas}
+xformula <- ~ time
+zformula <- ~ tissue_type
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(circ))
+col_offsets <- rep(0, ncol(circ))
+t_j <- NULL
+
+```
+
+# Preprocess
+
+For the non-family SVDX, we use `family = NULL`.
+
+Because sparse row-centering densifies the matrix, either use dense input or set `center_rows = FALSE` for sparse input unless we intentionally allow densification.
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "id", #these are the rownames in the circ data
+  label_col = "symbol", #these are what we will use for labeling features in plots
+  enrichment_col = "symbol" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = FALSE,              #already transformed      
+  t_j = rep(0, ncol(Y_raw)),
+  normalize = FALSE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = rep(0, ncol(Y_raw)),
+  row_offset = rep(0, nrow(Y_raw)),
+  dataset_name = "circadian"
+)
+```
+
+#benchmark
+```{r}
+METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view",
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+
+  K = 15,
+  
+  
+  methods = METHODS, 
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+  mefisto_covariates = "time",
+  
+  inference_methods = c("svdx"), 
+  
+  ftol_abs = 1e-5, 
+  
+  run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = NULL,
+  enrichment_backend = "internal",
+  msigdb_db_species = "MM", 
+  msigdb_species = "Mus musculus", 
+  msigdb_collection = "M5", 
+  msigdb_subcollection = "BP"
+)
+
+
+```
+
+
+#output
+```{r}
+rw <- runSingleBenchmarkReports( rw_single = rw_single, 
+                                 outdir = "./circadian",
+                                 overwrite=T, 
+                                 color="tissue_type", group="tissue_type", 
+                                 line_group = "tissue_type", 
+                                 xaxis="time", 
+                                 loading_enrichment = T,
+                                 enrichment_top_n = 25
+                                 )
+
+
+```
+
+# Figures output
+```{r}
+
+#Main
+source('./rwd/makeCircadianMainFigure.R')
+make_circadian_main_figure(
+  rw_single,
+   output_dir = "/tmp/circadian_alpha0p1", filename = "CircadianMain.pdf"
+)
+
+#Supplement
+source('./rwd/make_circadian_benchmark_supplement.R')
+make_circadian_benchmark_supplement(
+  rw_single,
+  outdir="./SN2_circadian_supplementary",
+  dataset_title = "circadian rhythms data",
+  note_number = 2, #simulations is 1  
+    
+  start_figure = 1L,
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color = "tissue_type",
+  group = "tissue_type",
+  line_group = "tissue_type",
+  xaxis = "time",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c("tissue_type", "time"),
+    heatmap_annotate = c("tissue_type", "time")
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+
+```
+

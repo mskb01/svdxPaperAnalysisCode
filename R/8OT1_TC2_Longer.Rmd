@@ -1,0 +1,237 @@
+---
+title: "Untitled"
+author: "senthil"
+date: "2026-08-29"
+output: html_document
+---
+
+
+Libraries
+```{r}
+
+#for mefisto
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+```
+
+
+Load data
+```{r load-raw}
+tc2 <- readRDS( file="./PD1_time_course_2_pseudobulk_pre_exclusion.rds" )
+tc2$xdata$treatment <- factor(tc2$xdata$treatment, levels=c("Control", "Anti-PD1"))
+tc2$xda$tissue <- factor(tc2$xdata$tissue) 
+
+fd <- data.frame( id = rownames(tc2$counts), symbol = rownames(tc2$counts) )
+rownames(fd) <- rownames(tc2$counts)
+tc2$xdata <- as.data.frame(tc2$xdata)
+rownames(tc2$xdata) <- colnames(tc2$counts)
+
+es <- ExpressionSet( assayData = as.matrix(tc2$counts), 
+                     phenoData = AnnotatedDataFrame( tc2$xdata ), 
+                     featureData = AnnotatedDataFrame( fd )
+                     )
+
+fdata <- fData(es)
+Y_raw <- exprs(es)
+xdata <- pData(es)
+xdata$treatment_tissue <- paste0( xdata$treatment, "_", xdata$tissue )
+zdata <- xdata
+
+
+```
+
+# Define SVDX formulas
+```{r formulas}
+xformula = ~treatment*day
+zformula = ~1 
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(es))
+col_offsets <- rep(0, ncol(es))
+tj <- colSums( exprs(es) ); tj <- tj/exp(mean(log(tj)))
+
+#data split
+set.seed(1)
+mouse_meta <- xdata |>
+  dplyr::distinct(mouse, day, treatment) |>
+  dplyr::mutate(
+    stratum = interaction(day, treatment, drop = TRUE)
+  )
+test_mice <- mouse_meta |>
+  dplyr::group_by(stratum) |>
+  dplyr::slice_sample(n = 1) |>
+  dplyr::ungroup() |>
+  dplyr::pull(mouse)
+
+xdata$split <- ifelse(
+  xdata$mouse %in% test_mice,
+  "test",
+  "train"
+)
+```
+
+# Preprocess
+
+For the non-family SVDX, we use `family = NULL`.
+
+Because sparse row-centering densifies the matrix, either use dense input or set `center_rows = FALSE` for sparse input unless we intentionally allow densification.
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "id", #these are the rownames in the circ data
+  label_col = "symbol", #these are what we will use for labeling features in plots
+  enrichment_col = "symbol" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = TRUE,              #already transformed      
+  t_j = tj,
+  normalize = TRUE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = col_offsets,
+  row_offset = row_offsets,
+  dataset_name = "antipd1"
+)
+```
+
+
+
+#Run
+
+```{r}
+METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view",
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+  
+  train_cols = which( prepared$xdata$split == "train" ),
+  
+  K = 15, 
+
+  methods = METHODS, 
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+  mefisto_covariates = "day",
+  inference_methods = c("svdx", "svdx_adjusted"), 
+  
+  ftol_abs = 1e-5, 
+  
+  run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = NULL,
+  enrichment_backend = "internal",
+  msigdb_db_species = "MM", 
+  msigdb_species = "Mus musculus", 
+  msigdb_collection = "M5", 
+  msigdb_subcollection = "BP"
+)
+
+rw <- runSingleBenchmarkReports(rw_single = rw_single, 
+                                    outdir = "./antipd1_tc2", overwrite=T, 
+                                 color="treatment", group="treatment", line_group = "treatment",
+                                xaxis="day", 
+                                 loading_enrichment = T, 
+                                    enrichment_top_n = 25, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("treatment", "day"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "treatment", 
+                                                         feature_profiles_top_n = 1L,
+                                                         x ="day"
+                                                         )
+                                 )
+
+
+```
+
+
+# Plots
+
+```{r}
+#main
+source('./rwd/makeOT1_TC2_MainFigure.R')
+make_OT1_TC2_main_figure(
+    rw_single,
+    output_dir="/tmp/OT1TC2",
+    filename = "Figure8_OT1TC2.pdf", Y = prepared$Y, fdata = prepared$fdata, xdata = xdata, 
+    width = 30,
+    height = 20
+)
+
+
+#supplement
+source('./rwd/make_single_benchmark_supplement.R')
+outs <- make_single_benchmark_supplement(
+  rw_single,
+  outdir="./SN7_OT1TC2_supplementary",
+  dataset_title = "time course 2 of anti-PD1 OT1 study. The figures include components, their decompositions, volcano plots for feature associations, and heatmaps of top 50 component-associated features at FDR of 10%",
+  note_number = 7, 
+    
+  start_figure = 270L,
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color=c("treatment"), 
+  group=c("treatment"), 
+  line_group = c("treatment"),
+  xaxis = "day",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c("treatment", "day"), 
+    heatmap_annotate = c("treatment", "day")
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+
+
+```
+

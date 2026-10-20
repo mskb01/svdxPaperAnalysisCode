@@ -1,0 +1,231 @@
+---
+title: "rwd_benchmark_ICB_bilateral.Rmd"
+author: "senthil"
+date: "2026-07-03"
+output: html_document
+---
+
+Libraries
+```{r}
+
+#for mefisto
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+
+```
+
+Load
+```{r load-raw}
+
+mouse <- read.csv( file="./GSE153941_ab1_count_matrix.txt", header=T, sep=" ")
+mouse <- as.matrix( mouse )
+mouse_renca <- read.csv( file="./GSE153941_renca_count_matrix.txt", header=T, sep=" ")
+mouse_renca <- as.matrix( mouse_renca )
+all(rownames(mouse) == rownames(mouse_renca))
+mouse <- cbind( mouse, mouse_renca )
+
+snames <- colnames(mouse)
+sid <- sapply( strsplit( snames, "_" ) , function(x) x[[1]][1])
+meta_ab <- read.csv( file= paste0(raw_dataset_dir, "/ab1_metadata.csv"),
+                     header=T ) %>% 
+  mutate( Timepoint = str_sub( Timepoint, 2,2 ) ) %>% 
+  mutate( Timepoint = as.numeric(Timepoint), 
+          Group = factor( Group, levels =c("RS", "NR") ) #responder, non responder
+          )
+
+meta_renca <- read.csv( file= paste0(raw_dataset_dir, "/renca_metadata.csv"),
+                     header=T ) %>% 
+  mutate( Timepoint = str_sub( Timepoint, 2,2 ) ) %>% 
+  mutate( Timepoint = as.numeric(Timepoint), 
+          Group = factor( Group, levels =c("RS", "NR") ) #responder, non responder
+          )
+all( colnames(meta_ab) == colnames(meta_renca) )
+meta <- rbind( meta_ab, meta_renca )
+meta <- meta[ match( sapply( strsplit( colnames(mouse),  "_"), function(x) x[[1]] ), meta$AGRF_ID ), ]
+rownames( meta ) <- colnames(mouse)
+meta$Tissue <- factor( meta$Tissue, levels=c("AB1", "Renca") )
+
+fd <- data.frame( id = rownames(mouse), symbol = rownames(mouse) )
+rownames(fd) <- rownames(mouse)
+
+es <- ExpressionSet( assayData = mouse, 
+                     phenoData = AnnotatedDataFrame( meta ), 
+                     featureData = AnnotatedDataFrame( fd )
+                     )
+
+fdata <- fData(es)
+Y_raw <- exprs(es)
+xdata <- pData(es) %>% mutate( TissueGroup = paste(Tissue, Group) ) 
+
+zdata <- xdata
+```
+
+# Define SVDX formulas
+```{r formulas}
+xformula = ~Group + Group:Timepoint 
+zformula = ~Tissue 
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(es))
+col_offsets <- rep(0, ncol(es))
+tj <- colSums( exprs(es) ); tj <- tj/exp(mean(log(tj)))
+
+```
+
+# Preprocess
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "id", #these are the rownames in the circ data
+  label_col = "symbol", #these are what we will use for labeling features in plots
+  enrichment_col = "symbol" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = TRUE,              #already transformed      
+  t_j = tj,
+  normalize = TRUE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = col_offsets,
+  row_offset = row_offsets,
+  dataset_name = "bilateral"
+)
+```
+
+
+#benchmark
+
+```{r}
+METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view",
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+  
+  K = 15, 
+
+  methods = METHODS, 
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+  mefisto_covariates = "Timepoint",
+  inference_methods = c("svdx"), 
+  
+  ftol_abs = 1e-5, 
+
+    run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = NULL,
+  enrichment_backend = "internal",
+  msigdb_db_species = "MM", 
+  msigdb_species = "Mus musculus", 
+  msigdb_collection = "M5", 
+  msigdb_subcollection = "BP"
+)
+
+rw <- runSingleBenchmarkReports(rw_single = rw_single, 
+                                    outdir = "./bilateral", overwrite=T, 
+                                 color="Group", group="Group", line_group = "Group",
+                                xaxis="Timepoint", 
+                                 loading_enrichment = T, 
+                                    enrichment_top_n = 25, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("Tissue", "Group", "Timepoint"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "Group", 
+                                                         feature_profile_facet = "Tissue", 
+                                                         feature_profiles_top_n = 1L,
+                                                         x ="Timepoint"
+                                                         )
+                                 )
+
+
+```
+
+
+# Figures output
+```{r}
+
+#main
+source("./makeBilateralMainFigure.R")
+make_bilateral_main_figure(
+  rw_single,
+   output_dir = "./bilateral", filename = "Figure4Bilateral.pdf"
+)
+
+#supplement
+source('./rwd/make_single_benchmark_supplement.R')
+tst <- make_single_benchmark_supplement(
+  rw_single,
+  outdir="./SN3_bilateral_supplementary",
+  dataset_title = "anti-PD-L1 immune checkpoint blockade data from bilateral AB1 and RENCA mouse models of mesothelioma and renal carcinoma, respectively. The mice were categorized as responders (RS) and non-responders (NR) for treatment", 
+  note_number = 3, #simulations is 1, real data 2  
+    
+  start_figure = 45L,#44 figs in circadian
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color = "Group",
+  group = "Group",
+  line_group = "Group",
+  xaxis = "Timepoint",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c( "Tissue", "Group", "Timepoint"),
+    heatmap_annotate = c( "Tissue", "Group", "Timepoint" )
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+
+
+```
+
+

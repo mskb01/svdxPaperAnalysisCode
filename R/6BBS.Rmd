@@ -1,0 +1,210 @@
+---
+title: "bbs"
+author: "senthil"
+date: "2026-07-08"
+output: html_document
+---
+
+Libraries
+```{r}
+
+#for mefisto : stuck at Sigma node for Mefisto? 
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+```
+
+
+
+```{r}
+require(dplyr)
+dir0 <- "./data/raw/bbs/bbs_svdx_starter/" 
+Y_mean <- readRDS( paste0(dir0,"/data_intermediate/Y_species_x_grid_year_mean_count.rds") )
+xdata  <- readRDS( paste0(dir0, "/data_intermediate/xdata_grid_year_frozen.rds") )
+fdata  <- readRDS( paste0(dir0, "/data_intermediate/fdata_species.rds") )
+feature_sets <- readRDS( paste0(dir0,"/data_intermediate/feature_sets.rds") )
+xdata <- as.data.frame(xdata)
+rownames(xdata) <- colnames(Y_mean)
+zdata <- xdata
+
+#some filtering for very uncommon taxa
+si <- which( (!is.na(xdata$breeding_mean_temperature)) & (!is.na(xdata$breeding_cumulative_precipitation)) )
+Y_mean <- Y_mean[,si]
+xdata <- xdata[si,]
+xdata$yearFac <- factor(xdata$year)
+zdata <- xdata
+
+ig <- which( rowSums(Y_mean>0) < 10 )
+names_ig <- rownames(Y_mean)[ig]
+Y_mean <- Y_mean[-ig, ]
+fdata <- fdata[-ig, ]
+
+
+```
+
+
+# Define SVDX formulas
+```{r formulas}
+xformula = ~lat_center*lon_center 
+zformula = ~yearFac
+zdata <- xdata
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(Y_mean))
+col_offsets <- rep(0, ncol(Y_mean))
+tj <- col_offsets
+
+```
+
+# Preprocess
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "species_id", #these are the rownames in the circ data
+  label_col = "common_name", #these are what we will use for labeling features in plots
+  enrichment_col = "species_id" #these are what we will use for enrichment when we do inferecne
+)
+
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_mean,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = TRUE,              #already transformed      
+  t_j = tj,
+  normalize = FALSE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = col_offsets,
+  row_offset = row_offsets,
+  dataset_name = "bbs"
+)
+```
+
+
+Run 
+```{r}
+
+METHODS <- c(
+  "svdx",
+  "pca",
+  #"mefisto_duplicate_view", #no mefisto as stuck at "optimizing sigma node"?
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+  
+  K = 15, 
+
+  methods = METHODS, 
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+  mefisto_covariates = c("lat_center", "lon_center"),
+  
+  inference_methods = c("svdx"), ftol_abs = 1e-5, fitter_maxIter=1000,
+  
+
+  run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = feature_sets,
+  enrichment_backend = "internal"
+  
+)
+
+
+
+
+rw <- runSingleBenchmarkReports(rw_single = rw_single,
+                                    outdir = "./bbs", overwrite=T, 
+                                 color="BCR", group="BCR", line_group = "BCR",
+                                xaxis="lon_center", 
+                                 loading_enrichment = T, 
+                                 enrichment_top_n = 25, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("year", "lon_center", "lat_center"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "BCR", 
+                                                         feature_profiles_top_n = 10L,
+                                                         x =year, 
+                                                         yaxis = "lat_center" 
+                                                         )
+                                 )
+
+```
+
+#new 
+```{r}
+#main 
+source('./rwd/makeBBSMainFigure.R')
+make_bbs_main_figure(
+  rw_single = rw_single,
+  output_dir = "./bbsMain"
+)
+
+#supplement
+source("./rwd/make_bbs_benchmark_supplement.R")
+outs <- make_bbs_benchmark_supplement(
+  rw_single,
+  outdir = "./SN9_BBS_supplementary",
+  dataset_title = "Breeding Bird Survey data.",
+  note_number = 9,
+  start_figure = 417L,#45 figs in circadian, 89 end in bilateral, 153 end in malaria, 210 end in OT1, 255 end in MM Plasma
+
+  methods = NULL,
+  components = NULL,
+
+  grid_id_col = "grid_id",
+  lat_col = "lat_center",
+  lon_col = "lon_center",
+  year_col = "year",
+
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+
+  volcano_labels_top_n = 6L,
+  
+  svdx_report_args = list(
+    heatmap_order_by = c("lon_center", "lat_center", "year"), 
+    heatmap_annotate = FALSE
+  ),
+
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+```
+

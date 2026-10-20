@@ -1,0 +1,276 @@
+---
+title: "Malaria"
+author: "senthil"
+date: "2026-07-06"
+output: html_document
+---
+
+Libraries
+
+```{r setup}
+
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+library(svdxBenchmark)
+library(svdx)
+library(ggplot2)
+library(stringr)
+library(data.table)
+```
+
+```{r load-raw}
+# Read and save data
+sc <- fread( "./SS2_counts.csv", header=T  )
+pd <- fread( "./SS2_pheno.csv", header=T  )
+
+```
+
+## from github
+
+https://github.com/vhowick/MalariaCellAtlas/tree/v1.0/Expression_Matrices/Smartseq2
+
+ShortenedLifeStage: The experimental groups of cells including
+bbSpz (bite back/ injected sporozoite)     
+EEF (Liver stage)
+Merozoite    
+oocyst (day 4 oocysts)     
+ook (Bolus ookinetes at 18 and 24 hrs)   
+ookoo (48 hr ookinetes and oocysts from midgut tissue)   
+Ring (Ring culture)
+sgSpz (salivary gland Sporozoites)  
+Shz (Late stage culture, includes male, female, trophozoites and schizonts)
+
+ShortenedLifeStage2: same as ShortenedLifeStage but with blood stage classifications from SC3 so Shz is split into Male, Female, Trophozoite, Schizont
+
+ShortenedLifeStage3: same as ShortendLifeStage2 but with ookoo split into Ookinete and Oocyst
+
+ShortendLifeStage4: same as ShortendLifeStage3 but with bbSpz and sgSpz combined to just Spz
+
+Colors in fig1 based on ShortendLifeStage2
+
+
+```{r load-raw}
+grp <- pd$ShortenedLifeStage2
+grp <- factor( grp, levels=c( "EEF", "Ring",  "Trophozoite",  "Schizont", "Merozoite", "Male", "Female","ook", "ookoo", "oocyst", "sgSpz","bbSpz"  ) )
+mat <- as.matrix( sc[,-1] )
+rownames(mat) <- sc$V1
+tj <- colSums( mat ); stopifnot( all(tj>0) )
+tj <- tj/exp(mean(log(tj)))
+.pd <- data.frame(
+  tj=tj, 
+  logtj=log(tj),
+  group=grp
+)
+rownames(.pd) <- colnames(mat)
+
+#rownames(mat) were used with plasmodb to extract annotations
+fd_plasmodb <- read.csv(file= "./fdata_plasmodb.txt", header=1, sep="\t")
+fd_plasmodb <- fd_plasmodb[ match( rownames(mat), fd_plasmodb$Input.ID ), ]
+rownames(fd_plasmodb) <- rownames(mat)
+
+#there are many genes for which we don't have names. For these, we shift to feature ids. 
+nai <- which(fd_plasmodb$Gene.Name.or.Symbol == "N/A")
+fd_plasmodb$Gene.Name.or.Symbol[ nai ] <- fd_plasmodb$Input.ID[nai]
+
+
+es <- ExpressionSet( assayData = mat, 
+                     phenoData = AnnotatedDataFrame( .pd ), 
+                     featureData = AnnotatedDataFrame( fd_plasmodb)
+                     )
+es$group <- factor( es$group, levels=levels(grp) )
+
+fdata <- fData(es)
+Y_raw <- exprs(es)
+xdata <- pData(es)
+zdata <- xdata
+
+# -- enrichment set
+library(tidyverse)
+library(GO.db)
+df_clean <- fdata %>%
+  dplyr::select(Input.ID, Curated.GO.Processes) %>% 
+  filter(!is.na(Curated.GO.Processes)) %>%
+  filter(Curated.GO.Processes != "" & Curated.GO.Processes != "NA" & Curated.GO.Processes != "N/A") %>%
+  separate_rows(Curated.GO.Processes, sep = ";") %>%
+  mutate(Curated.GO.Processes = trimws(Curated.GO.Processes)) %>%
+  filter(Curated.GO.Processes != "")
+go_mapping <- Term(GOTERM) 
+df_clean$GO_Description <- go_mapping[df_clean$Curated.GO.Processes]
+df_clean <- df_clean %>%
+  mutate(GO_Description = ifelse(is.na(GO_Description), Curated.GO.Processes, GO_Description))
+enrichment_list <- split(df_clean$Input.ID, df_clean$GO_Description)
+enrichment_list <- enrichment_list[ sapply( enrichment_list, length) >= 5 ]
+```
+
+# Define SVDX formulas
+```{r formulas}
+xformula = ~group 
+zformula = ~1
+
+set.seed(1)
+train_samples <- unlist( lapply(unique(xdata$group), function(g){
+  gsi <- which( xdata$group == g )
+  sample(gsi, .7*length(gsi))
+  }) )
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(es))
+col_offsets <- rep(0, ncol(es))
+tj <- colSums( exprs(es) ); tj <- tj/exp(mean(log(tj)))
+
+```
+
+# Preprocess
+
+```{r preprocess}
+
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "Input.ID", #these are the rownames in the circ data
+  label_col = "Gene.Name.or.Symbol", #these are what we will use for labeling features in plots
+  enrichment_col = "Input.ID" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = TRUE,              #already transformed      
+  t_j = tj,
+  normalize = TRUE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = col_offsets,
+  row_offset = row_offsets,
+  dataset_name = "malaria_berghei"
+)
+```
+
+
+Run 
+```{r}
+
+#benchmark
+METHODS <- c(
+  "svdx",
+  "pca",
+  ##"mefisto_duplicate_view", #no mefisto as only categorical covarates here
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  train_cols = train_samples,
+  fdata = fdata, 
+  
+  K = 15, #max number of distinct groups here
+
+  methods = METHODS,
+  inference_methods = c("svdx"), ftol_abs = 1e-5, xtol_abs=1e-3, fitter_maxIter = 1000, 
+  
+  run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = enrichment_list, 
+  
+  nfolds = 10 #svdx folds , we have good amount of data
+  
+)
+
+
+#output
+rw <- runSingleBenchmarkReports(rw_single = rw_single, 
+                                    outdir = "./malaria_berghei_nfolds10", overwrite=T, 
+                                 color="group", group="group", line_group = "group",
+                                xaxis="group", 
+                                 loading_enrichment = T, 
+                                    enrichment_top_n = 25, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("group"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "group", 
+                                                         feature_profiles_top_n = 5L,
+                                                         x ="group"
+                                                         )
+                                 )
+
+
+```
+
+
+#Figure output
+
+```{r}
+
+
+#main
+source('./makeMalariaMainFigure.R')
+make_Malaria_main_figure(
+    rw_single,
+    Y=prepared$Y,
+    xdata=prepared$xdata,
+    fdata=prepared$fdata,
+    output_dir="./Malaria",
+    filename = "Figure5_Malaria.pdf",
+    width = 30,
+    height = 20
+)
+
+#supplement
+source('./make_single_benchmark_supplement.R')
+make_single_benchmark_supplement(
+  rw_single,
+  outdir="./SN4_malaria_supplementary",
+  dataset_title = "single cell malarial parasite, P. berghei, data",
+  note_number = 4, #simulations is 1, real data 2  
+    
+  start_figure = 89L,#45 figs in circadian, 88 end in bilateral, 
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color = "group",
+  group = "group",
+  line_group = "group",
+  xaxis = "group",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c( "group"),
+    heatmap_annotate = c( "group" )
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+
+
+
+```
+

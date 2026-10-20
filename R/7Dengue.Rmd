@@ -1,0 +1,208 @@
+---
+title: "rwd_benchmark_dengue"
+author: "senthil"
+date: "2026-06-25"
+output: html_document
+---
+
+Libraries
+```{r setup}
+
+#for mefisto 
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+
+```
+
+```{r}
+#iobw download 
+indices <- read.table( file="./dengue_iobw/climateData/M_Oce_Er.txt",header=T ) %>% 
+  as_tibble( rownames="yearmonth" ) 
+
+iobwDownload <- read.csv( file="./dengue_iobw/ncc_climate_indices_monthly.csv", header=T)
+```
+
+
+```{r load-raw}
+iobw <- readRDS( file="./dengue_iobw/dengueAll.RDS" )
+pd <- pData(iobw$authorDat)
+pd <-pd %>%
+  left_join( iobwDownload, by=c("year", "month") )
+stopifnot( all(pd$date.x == pd$date.y))
+pd$date <- pd$date.x
+
+rownames(pd) <- colnames(iobw$authorDat)
+es <- ExpressionSet( assayData=exprs(iobw$authorDat[,-1]), #no detrend value for the first starting point in author data
+                     phenoData = AnnotatedDataFrame( pd[-1,] ),
+                     featureData = featureData( iobw$authorDat )
+                     )
+
+```
+
+
+# Define svdx specs
+```{r}
+fdata <- fData(es)
+Y_raw <- exprs(es)
+xdata <- pData(es)
+zdata <- xdata
+
+
+xformula <- ~ month * iobw_lag_1_3
+.modelType <- list( "month" = list( "cubic", range(xdata$month) ),
+                    "iobw_lag_1_3" = list( "cubic", range(xdata$iobw_lag_1_3) )
+                    )
+zformula <- ~ 1
+row_offsets <- rep(0, nrow(es))
+col_offsets <- rep(0, ncol(es))
+t_j <- NULL
+
+```
+
+# Preprocess
+
+For the non-family SVDX, we use `family = NULL`.
+
+Because sparse row-centering densifies the matrix, either use dense input or set `center_rows = FALSE` for sparse input unless we intentionally allow densification.
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "country", #these are the rownames in the circ data
+  label_col = "country", #these are what we will use for labeling features in plots
+  enrichment_col = "country" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  modelType = .modelType, 
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = FALSE,              #already transformed      
+  t_j = rep(0, ncol(Y_raw)),
+  normalize = FALSE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = rep(0, ncol(Y_raw)),
+  row_offset = rep(0, nrow(Y_raw)),
+  dataset_name = "dengue"
+)
+```
+
+
+Run 
+```{r}
+
+
+METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view", 
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+  
+  K = 15,
+
+  methods = METHODS,
+  inference_methods = c("svdx", "svdx_adjusted"), ftol_abs = 1e-5, 
+  
+  train_fraction = 1,
+  
+  run_factorization = TRUE,
+  run_inference = FALSE,
+  
+  modelType = prepared$modelType
+  
+)
+
+
+rw <- runSingleBenchmarkReports( rw_single = rw_single, components = 1:10,
+                                    outdir = "./dengue_iobw_interactions", overwrite=T, 
+                                 color=NULL, group=NULL, line_group = NULL, xaxis="date", 
+                                 u_plot_specs = list(list("connect"=T)), 
+                                 loading_enrichment = F
+                                 )
+
+```
+
+
+#OUTPUT
+```{r}
+#main 
+source('./rwd/makeDengueMainFigure.R')
+make_Dengue_main_figure(
+  rw_single = rw_single,
+  output_dir = "./dengue",
+  example_countries = c("Mexico", "Colombia"),   
+  heatmap_top_n = 10
+)
+
+#supplement
+source('./rwd/make_single_benchmark_supplement.R')
+outs <- make_single_benchmark_supplement(
+  rw_single,
+  outdir="./dengueIOBW",
+  dataset_title = "global dengue data. Given the smaller sample size, only a factorization analysis was done.",
+  note_number = 8, 
+    
+  start_figure = 321L,
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = list( list(
+    var = "date",
+    connect = TRUE
+  ) ),
+  color=NULL, 
+  group=NULL, 
+  line_group = NULL,
+  xaxis = "date",
+  facet = NULL,
+  features_top_n = 10L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c("date"), 
+    heatmap_annotate = FALSE
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE, 
+  loading_heatmaps = T, 
+  loading_enrichment = T 
+  
+)
+
+
+```
+

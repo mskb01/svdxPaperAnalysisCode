@@ -1,0 +1,258 @@
+---
+title: "MM"
+author: "senthil"
+date: "2026-07-13"
+output: html_document
+---
+
+Libraries
+```{r setup}
+
+
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+library(svdxBenchmark)
+library(svdx)
+library(ggplot2)
+library(stringr)
+library(data.table)
+```
+
+```{r load-raw}
+#Read counts, generate and save sparse matrix
+
+  countsFile <- "./GSE193531_umi-count-matrix.csv" 
+  mati <- fread( file=countsFile, header=T)
+  spmati <- mltools::sparsify(mati[,-1])
+  rownames(spmati) <- mati$V1
+  rm( mati, countsFile )
+  
+  #Read metadata
+  metaFile <- "./GSE193531_cell-level-metadata.csv" 
+  meta <- fread( file=metaFile, header=T )
+  saveRDS( list(spmat=spmati,
+                meta=meta
+                ), 
+           file="./SPARSE_WITH_META_GSE193531_umi-count-matrix.RDS") 
+  
+
+dat <- readRDS( file= "./SPARSE_WITH_META_GSE193531_umi-count-matrix.RDS" )
+
+#Pseudo bulk
+donor <- unique(dat$meta$sample_ID)
+us<- unique( dat$meta$sample_ID )
+ns <- sapply( us, function(s) sum( dat$meta$sample_ID == s ) )
+pseudo <- do.call(cbind, lapply( us, function(s){
+  si <- which( dat$meta$sample_ID == s )
+  Matrix::rowSums( dat$spmat[,si] )
+} ) )
+group <- sapply(strsplit( donor, "-" ), function(x) x[[1]][1])
+table(group)
+pd <- data.frame( donor=donor, group=group ); rownames(pd) = colnames(pseudo)
+pd$group <- factor(pd$group, levels=c("NBM", "MGUS", "SMM", "MM"))
+pseudo <- ExpressionSet( assayData = pseudo, phenoData=AnnotatedDataFrame(pd)  )
+pseudo <- pseudo[which( rowSums( exprs(pseudo) )>0  ), ]
+tj <- colSums( exprs(pseudo) ); tj <- tj/exp(mean(log(tj))); stopifnot( all(is.finite(tj)) )
+
+#tech data
+meta1 <- read.csv(file="./MM_annotations_merged.csv" ) 
+meta1 <- meta1[ match( pseudo$donor, meta1$Boiarsky2022_IDs ), ]
+
+# 138P samples as they correspond to plasma cells fraction used in this study
+meta2 <- read.csv(file="./sample_info_10X_May4.txt", sep="\t" )
+meta2_batches <- do.call(rbind, lapply( meta1$dfci_id, function(id){
+  s <- meta2[grep( id, meta2$sample ),]
+  s[ which( grepl( "138P$", s$sample ) ),,drop=F ]
+} ) ) 
+meta2_batches_final <- meta2_batches[ match( meta1$dfci_id, unlist(strsplit(meta2_batches$sample, "CD138P") ) ), ]
+
+newMeta <-  data.frame( meta1, meta2_batches_final )
+pd <- pd %>% 
+  bind_cols( newMeta %>% 
+               dplyr::select( dfci_id, Zavidij2020_IDs, Boiarsky2022_IDs, sample, batch ) 
+             )
+pd$batch <- factor( pd$batch )
+table( pd$batch, pd$group )
+rownames( pd ) <- colnames(pseudo)
+
+fd <- data.frame( id = rownames(pseudo), symbol = rownames(pseudo) )
+rownames(fd) <- rownames(pseudo)
+
+es <- ExpressionSet( assayData = exprs(pseudo),
+                              phenoData = AnnotatedDataFrame(pd),
+                              featureData =AnnotatedDataFrame(fd)
+                              )
+
+
+
+```
+
+
+
+# Run 
+```{r}
+xformula = ~group
+zformula = ~batch
+
+  fdata <- fData(es)
+  Y_raw <- exprs(es)
+  xdata <- pData(es) #%>% mutate( TissueGroup = paste(Tissue, Group) ) 
+  zdata <- xdata
+  
+  row_offsets <- rep(0, nrow(es))
+  col_offsets <- rep(0, ncol(es))
+  t_j <- colSums( exprs(es) ); t_j <- t_j/exp(mean(log(t_j)))
+  
+  fdata <- as_svdx_fdata(
+    fdata,
+    feature_col = "id", #these are the rownames in the circ data
+    label_col = "symbol", #these are what we will use for labeling features in plots
+    enrichment_col = "symbol" #these are what we will use for enrichment when we do inferecne
+    )
+
+  prepared <- svdx:::prepare_svdx_data(
+    Y = Y_raw,
+    xdata = xdata,
+    zdata = zdata,
+    xformula = xformula,
+    zformula = zformula,
+    fdata = fdata,
+    family = NULL, 
+    log1p_transform = TRUE,              #already transformed      
+    t_j = t_j,
+    normalize = TRUE,                    #data has already been normalization
+    top_ftrs = 5000,
+    center_rows = TRUE,    
+    scale_rows = TRUE,
+    allow_sparse_densification = TRUE,
+    col_offset = col_offsets,
+    row_offset = row_offsets,
+    dataset_name = "mm_plasma"
+  )
+
+  
+  METHODS <- c(
+  "svdx",
+  "pca",
+  #"mefisto_duplicate_view", #no mefisto as only categorical covarates
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+  )
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+#benchmark
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  
+  K = 15,
+  
+  train_fraction = 1,
+  
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+
+  methods = METHODS,
+  inference_methods = c("svdx"), ftol_abs = 1e-5, fitter_maxIter = 400, 
+  
+  run_factorization = TRUE,
+  run_inference = FALSE,
+  
+  inference_scope = "all",
+  feature_sets = NULL,
+  enrichment_backend = "internal",
+  msigdb_db_species = "Hs", 
+  msigdb_species = "Homo sapiens", 
+  msigdb_collection = "C5", 
+  msigdb_subcollection = "BP"
+)
+
+#output
+
+rw <- runSingleBenchmarkReports(rw_single = rw_single, 
+                                    outdir = "./mm_plasma",
+                                overwrite=T, 
+                                 color="group", group="group", line_group = "group",
+                                xaxis="group", 
+                                 loading_enrichment = T, 
+                                    enrichment_top_n = 20, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("group","batch"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "group", 
+                                                         feature_profiles_top_n = 5L,
+                                                         x ="group"
+                                                         )
+                                 )
+  
+  
+  
+
+
+
+```
+
+
+## Figure
+```{r}
+
+#main 
+source('./rwd/makeMMMainFigure.R')
+make_MM_main_figure(
+    rw_single,
+    Y=prepared$Y,
+    output_dir="./MM",
+    filename = "MMMainFigure.pdf",
+    width = 30,
+    height = 20
+)
+
+# supplementary
+source('./rwd/make_single_benchmark_supplement.R')
+
+outs <- make_single_benchmark_supplement(
+  rw_single,
+  outdir="./SN5_MMPlasma_supplementary",
+  dataset_title = "multiple myeloma study. Given the smaller sample size, only a factorization analysis was done. The figures include components, their decompositions, and heatmaps of top 50 features with highest absolute loadings",
+  note_number = 5, #simulations is 1, real data 2  
+    
+  start_figure = 168L,#45 figs in circadian, 89 end in bilateral, 167 end in malaria, 210 end in OT1
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color="group", 
+  group="group", 
+  line_group = "group",
+  xaxis = "group",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c("group", "batch"), 
+    heatmap_annotate = c("group", "batch")
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE, 
+  loading_heatmaps = T, 
+  loading_enrichment = T
+)
+
+
+
+```

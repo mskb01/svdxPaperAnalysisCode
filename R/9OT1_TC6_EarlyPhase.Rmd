@@ -1,0 +1,254 @@
+---
+title: "Untitled"
+author: "senthil"
+date: "2026-08-29"
+output: html_document
+---
+
+
+Libraries
+```{r}
+
+#for mefisto
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+
+
+library(ggplot2)
+library(svdx)
+library(svdxBenchmark)
+library(tidyverse)
+library(Matrix)
+library(Biobase)
+```
+
+
+```{r load-raw}
+tc2 <- readRDS( file="PD1_time_course_6_pseudobulk.rds" )
+tc2$xdata$treatment <- factor(tc2$xdata$treatment, levels=c("Control", "Anti-PD1"))
+tc2$xda$tissue <- factor(tc2$xdata$tissue) #only one 
+tc2$xdata$cell_type #only one
+
+fd <- data.frame( id = rownames(tc2$counts), symbol = rownames(tc2$counts) )
+rownames(fd) <- rownames(tc2$counts)
+tc2$xdata <- as.data.frame(tc2$xdata)
+rownames(tc2$xdata) <- colnames(tc2$counts)
+
+es <- ExpressionSet( assayData = as.matrix(tc2$counts), 
+                     phenoData = AnnotatedDataFrame( tc2$xdata ), 
+                     featureData = AnnotatedDataFrame( fd )
+                     )
+
+fdata <- fData(es)
+Y_raw <- exprs(es)
+xdata <- pData(es)
+xdata$treatment_tissue <- paste0( xdata$treatment, "_", xdata$tissue )
+
+zdata <- xdata
+
+
+```
+
+# Define SVDX formulas
+```{r formulas}
+xformula = ~treatment*tissue*day
+zformula = ~1 
+
+```
+
+# Optional inputs
+```{r optional-inputs}
+row_offsets <- rep(0, nrow(es))
+col_offsets <- rep(0, ncol(es))
+tj <- colSums( exprs(es) ); tj <- tj/exp(mean(log(tj)))
+
+
+mice <- unique(xdata$mouse)
+test_n <- c(
+  "1_Control" = 1,
+  "2_Control" = 1,
+  "2_Anti-PD1" = 0,
+  "3_Control" = 0,
+  "3_Anti-PD1" = 1,
+  "4_Control" = 1,
+  "4_Anti-PD1" = 1,
+  "5_Control" = 1,
+  "5_Anti-PD1" = 1,
+  "6_Control" = 1,
+  "6_Anti-PD1" = 1
+)
+
+mouse_meta <- xdata |>
+  distinct(mouse, day, treatment) |>
+  mutate(stratum = paste(day, treatment, sep = "_"))
+
+set.seed(1)
+test_mice <- unlist(
+  lapply(names(test_n), function(s) {
+    mice <- mouse_meta$mouse[mouse_meta$stratum == s]
+    sample(mice, size = test_n[s])
+  })
+)
+
+xdata$split <- ifelse(
+  xdata$mouse %in% test_mice,
+  "test",
+  "train"
+)
+
+xdata |>
+  distinct(mouse, day, treatment, split) |>
+  count(day, treatment, split)
+```
+
+# Preprocess
+
+```{r preprocess}
+fdata <- as_svdx_fdata(
+  fdata,
+  feature_col = "id", #these are the rownames in the circ data
+  label_col = "symbol", #these are what we will use for labeling features in plots
+  enrichment_col = "symbol" #these are what we will use for enrichment when we do inferecne
+)
+
+prepared <- svdx:::prepare_svdx_data(
+  Y = Y_raw,
+  xdata = xdata,
+  zdata = zdata,
+  xformula = xformula,
+  zformula = zformula,
+  fdata = fdata,
+  family = NULL, 
+  log1p_transform = TRUE,              #already transformed      
+  t_j = tj,
+  normalize = TRUE,                    #data has already been normalization
+  top_ftrs = 5000,
+  center_rows = TRUE,    
+  scale_rows = TRUE,
+  allow_sparse_densification = TRUE,
+  col_offset = col_offsets,
+  row_offset = row_offsets,
+  dataset_name = "antipd1"
+)
+```
+
+
+
+#benchmark
+```{r}
+METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view",
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf"
+)
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * nrow(prepared$Y))
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1)
+
+rw_single <- run_real_world_single_benchmark(
+  
+  Y = prepared$Y,
+  data = prepared$xdata,
+  xformula = prepared$xformula,
+  zdata = prepared$zdata,
+  zformula = prepared$zformula,
+  fdata = fdata, 
+  
+  train_cols = which( prepared$xdata$split == "train" ),
+  
+  K = 15, 
+
+  methods = METHODS, 
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+  mefisto_covariates = "day",
+  inference_methods = c("svdx"), 
+  
+  ftol_abs = 1e-5, 
+  
+  run_factorization = TRUE,
+  run_inference = TRUE,
+  
+  inference_scope = "all",
+  feature_sets = NULL,
+  enrichment_backend = "internal",
+  msigdb_db_species = "MM", 
+  msigdb_species = "Mus musculus", 
+  msigdb_collection = "M5", 
+  msigdb_subcollection = "BP"
+)
+
+rw <- runSingleBenchmarkReports(rw_single = rw_single, 
+                                    outdir = "./antipd1_tc6", overwrite=T, 
+                                 color="treatment_tissue", group="treatment_tissue", line_group = "treatment_tissue",
+                                xaxis="day", 
+                                 loading_enrichment = T, 
+                                    enrichment_top_n = 25, 
+                                svdx_report_args = list( z_adjustment = "fitted", 
+                                                         heatmap_order_by = c("treatment", "tissue",  "day"), 
+                                                         feature_profile_show_se = T , 
+                                                         feature_profile_color = "treatment", 
+                                                         feature_profile_facet = "tissue", 
+                                                         feature_profiles_top_n = 1L,
+                                                         x ="day"
+                                                         )
+                                 )
+
+
+
+
+```
+
+
+# Plots
+
+```{r}
+#main
+source('./rwd/makeOT1_TC6_MainFigure.R')
+make_OT1_TC6_main_figure(
+    rw_single,
+    output_dir="./OT1TC6",
+    filename = "Figure7_OT1TC6.pdf",
+    width = 30,
+    height = 20
+)
+
+
+#supplement
+source('./rwd/make_single_benchmark_supplement.R')
+
+outs <- make_single_benchmark_supplement(
+  rw_single,
+  outdir="./SN6_OT1TC6_supplementary",
+  dataset_title = "time course 6 of anti-PD1 OT1 study. Samples collected at day 1 were available only from control animals, whereas both control and anti-PD-1-treated animals were observed from day 2 onward. The general SSANOVA-SVD representation without imposing experiment-specific structure at treatment initiation. So fitted anti-PD-1 component functions at day 1 are extrapolated. The figures include components, their decompositions, volcano plots for feature associations, and heatmaps of top 50 component-associated features at FDR of 10%",
+  note_number = 6,
+    
+  start_figure = 213L,
+  methods = NULL,
+  components = NULL,
+  u_plot_specs = NULL,
+  color=c("treatment", "tissue"), 
+  group=c("treatment", "tissue"), 
+  line_group = c("treatment", "tissue"),
+  xaxis = "day",
+  facet = NULL,
+  features_top_n = 50L,
+  enrichment_top_n = 25L,
+  enrichment_fdr = 0.1,
+  volcano_labels_top_n = 10L,
+  volcano_label_features = NULL,
+  svdx_report_args = list(
+    heatmap_order_by = c("treatment", "tissue",  "day"), 
+    heatmap_annotate = c("treatment", "tissue",  "day")
+  ),
+  text_size = 25,
+  compile = FALSE,
+  verbose = TRUE
+)
+
+```

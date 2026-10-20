@@ -1,0 +1,289 @@
+---
+title: "Simulations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(reticulate)
+reticulate::use_condaenv("mofa2_env", required = TRUE)
+reticulate::py_config()
+reticulate::py_module_available("mofapy2")
+reticulate::py_module_available("sklearn")
+
+library(svdxBenchmark)
+library(svdx)
+library(dplyr)
+library(ggplot2)
+```
+
+
+# Check
+```{r}
+SEEDS <- 1:3
+NG_GRID <- c(10, 20, 40)
+CONFOUNDING_GRID <-c(0.0, .5) #c(0.0, 0.25, .5)
+BATCH_TO_BIOLOGY_GRID <- 1
+
+# Gaussian feature-wise residual variance:
+# sigma_j^2 = sigma^2 * Gamma(shape = a, rate = a)
+# Larger a => more similar variances across features.
+FEATURE_NOISE_SHAPE_GRID <- c(1) 
+BATCH_BIOLOGY_OVERLAP_GRID <- c(0, .5) 
+BATCH_FEATURE_FRACTION <- .4
+TIME_IMBALANCE_GRID <- c(.5) 
+
+P <- 5000
+G <- 5
+B <- 5
+K <- 15
+N_MODULES <- 4
+pi_signal <- (.1/N_MODULES) 
+
+ALL_FACTORIZATION_METHODS <- c(
+  "svdx",
+  "pca",
+  "mefisto_duplicate_view",
+  "nmf",
+  "mixomics_pls",
+  "spca",
+  "sparse_nmf" #see below
+  )
+INFERENCE_METHODS <- c("svdx")
+SPCA_KEEPX_GRID <- round(c(0.01, 0.25, 0.5) * P)
+SPARSE_NMF_LAMBDA_GRID <- 10^c(-3, -2, -1) 
+
+cbio_cbatch = cbind( c(2,2) )
+
+runFn <- function(cbio, cbatch, fname){
+  
+  single_grid <- run_single_benchmark_grid(
+  
+  seeds = 1:3,
+  family_grid = "gaussian",
+  fit_family = NULL,
+  inference_family = "gaussian",
+
+  ng_grid = NG_GRID,
+  confounding_grid = CONFOUNDING_GRID,
+  batch_to_biology_ratio_grid = BATCH_TO_BIOLOGY_GRID,
+  feature_noise_shape_grid = FEATURE_NOISE_SHAPE_GRID,
+  batch_biology_overlap_fraction_grid = BATCH_BIOLOGY_OVERLAP_GRID,
+  time_imbalance_grid = TIME_IMBALANCE_GRID,
+
+  p = P,
+  G = G,
+  B = B,
+  K = K,
+  n_modules = N_MODULES,
+
+  simulator_args = list(
+    pi_signal = pi_signal,
+    batch_feature_fraction = BATCH_FEATURE_FRACTION, 
+    severity_group_shift = 0 ,# this prevents severity from acting as a proxy for group
+    c_bio=cbio,
+    c_batch=cbatch
+  ),
+
+  run_factorization = TRUE,
+  run_inference = TRUE,
+
+  factorization_methods = ALL_FACTORIZATION_METHODS,
+  inference_methods = INFERENCE_METHODS,
+
+  spca_keepX_grid = SPCA_KEEPX_GRID,
+  sparse_nmf_lambda_grid = SPARSE_NMF_LAMBDA_GRID,
+
+  loading_top_n = 100,
+
+  keep_runs = FALSE, 
+  
+  ## For svdx 
+  numThreads = 3, 
+  svdx_args = list( fitter_maxIter= 1000, fitter_eps = 1e-3, ftol_abs=1e-5 )
+  )
+  
+  saveRDS( single_grid, file=fname  )
+  
+  single_grid
+  
+}
+
+cbio <- 2
+cbatch <- 2
+fn <- paste0("./simulation_cbio_", cbio, "_cbatch_", cbatch, ".RDS")
+runFn( cbio, cbatch, fn )
+
+
+```
+
+
+#Plots
+```{r}
+
+# Reconstruction error: all features, fitted K
+bench <- readRDS( file=paste0("./simulation_cbio_", 2, "_cbatch_", 2, ".RDS") )
+
+# Signal features only
+signal <- plot_single_reconstruction_error(
+  bench,
+  feature_set = "signalFeatures",
+  k_scope = c("svdxK")
+)
+#non signal features : both batch and null
+nulls <- plot_single_reconstruction_error(
+  bench,
+  feature_set = "nonSignalFeatures",
+  k_scope = c("svdxK")
+)
+#Inference
+infSignal <- plot_single_inference_metrics(
+  bench,
+  metrics = c(
+  "inference_auc_signal_vs_null",
+  "power",
+  "type1_error",
+  "empirical_fdr"
+), average_over = "seed" )
+
+
+library(patchwork)
+panel_tag_theme <- theme(
+  plot.tag = element_text(
+    size = 28,
+    face = "bold",
+    family = "Helvetica"
+  ),
+  plot.tag.position = c(0.1, 2)
+)
+
+#reconstruction at 0 batch/bio feature overlap, in signal and non-signal/nulls
+a0_signalRec <- signal$signalFeatures__svdxK__all__0 + labs(title=NULL) + ylab( "Avg. reconstruction error: Signal" ) 
+a0_signalRecZoomed <-a0_signalRec + ylim(c(0.25,1))
+a0_nullRec <- nulls$nonSignalFeatures__svdxK__all__0 + labs(title=NULL) + ylab( "Avg. reconstruction error: Nulls" ); 
+a0_power <- infSignal$power__0 + labs(title=NULL) + ylab("Power") + ylim(c(0,1))
+a0_type1err <- infSignal$type1_error__0 + labs(title=NULL) + ylab("Type 1 error rate") + ylim(c(0, 1)) + geom_hline(yintercept = .05,linetype = 2)
+a0_fdr <- infSignal$empirical_fdr__0 + labs(title=NULL) + ylab("FDR") + geom_hline(yintercept=.1,linetype = 2) + ylim(0,1)
+
+#reconstruction at 50% batch/bio feature overlap, in signal and non-signal/nulls
+a0p5_signalRec <- signal$signalFeatures__svdxK__all__0_5 + labs(title=NULL) + ylab( "Avg. reconstruction error: Signal" ); 
+a0p5_signalRecZoomed <- a0p5_signalRec + ylim(c(0.25,.75))
+a0p5_nullRec <- nulls$nonSignalFeatures__svdxK__all__0_5 + labs(title=NULL) + ylab( "Avg. reconstruction error: Nulls" );
+a0p5_power <- infSignal$power__0_5 + labs(title=NULL) + ylab("Power") + ylim(c(0,1))
+a0p5_type1err <- infSignal$type1_error__0_5 + labs(title=NULL) + ylab("Type 1 error rate") + ylim(c(0,1))+ geom_hline(yintercept = .05, linetype = 2)
+a0p5_fdr <- infSignal$empirical_fdr__0_5 + labs(title=NULL) + ylab("FDR") +
+  geom_hline(yintercept=.1, linetype = 2) + ylim(c(0,1))
+
+#AUC
+signalAuc <- plot_single_all_signal_pooled_auc(
+  bench,
+  k_scope = c("svdxK")
+)
+sfac <- plot_single_factorization_metrics(single_grid, average_over = c("seed"),
+                                          facet_var = "confounding", 
+  metrics = c(
+    "loading_feature_auc_signal_vs_non_signal_at_svdxK",
+    "loading_feature_auc_signal_vs_non_signal_at_allK",
+    "loading_feature_auc_batch_vs_non_batch_at_svdxK",
+    "loading_feature_auc_batch_vs_non_batch_at_allK",
+    "loading_feature_auc_signal_vs_batch_only_at_svdxK"
+  )
+)
+signalAuc_0 <- signalAuc$svdxK__0 + ylab( "Signal AUC" ) + labs(title=NULL)
+batchAuc_0 <- sfac$loading_feature_auc_batch_vs_non_batch_at_svdxK__0 + ylab("Batch AUC") + labs(title=NULL)
+
+signalAuc_0p5 <- signalAuc$svdxK__0_5 + ylab( "Signal AUC" ) + labs(title=NULL)
+batchAuc_0p5 <- sfac$loading_feature_auc_batch_vs_non_batch_at_svdxK__0_5 + ylab("Batch AUC") + labs(title=NULL)
+
+
+drop_adjusted <- function(p) {
+  p$data <- p$data |>
+    dplyr::filter(method != "svdx_adjusted")
+  p
+}  
+b <- ggplot_build(a0_signalRec); #get colors
+method_names <- b$plot$scales$get_scales("colour")$get_limits()
+
+plot0 <- wrap_plots(
+  drop_adjusted(a0_signalRec) + labs(tag = "A"),
+  drop_adjusted(a0_signalRecZoomed),
+  drop_adjusted(a0_nullRec),
+
+  drop_adjusted(a0_power) + labs(tag = "B") + theme(legend.position = "none"),
+  drop_adjusted(a0_type1err)               + theme(legend.position = "none"),
+  drop_adjusted(a0_fdr)                    + theme(legend.position = "none"),
+
+  drop_adjusted(signalAuc_0) + labs(tag = "C") + theme(legend.position = "none"),
+  drop_adjusted(batchAuc_0)                       + theme(legend.position = "none"),
+  guide_area(),
+
+  ncol = 3,
+  nrow = 3,
+  guides = "collect"
+) &
+  scale_color_discrete(limits = method_names[method_names!="svdx_adjusted"]) &
+  guides(
+    colour = guide_legend(ncol = 2)
+  ) &
+  theme(aspect.ratio = 1, 
+        plot.tag = element_text(face = "bold", size = 20), 
+        text = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 15),
+        strip.text = element_text(size = 15),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10)
+        )
+
+
+plot0p5 <- wrap_plots(
+  drop_adjusted(a0p5_signalRec) + labs(tag = "A"),
+  drop_adjusted(a0p5_signalRecZoomed),
+  drop_adjusted(a0p5_nullRec),
+
+  drop_adjusted(a0p5_power) + labs(tag = "B") + theme(legend.position = "none"),
+  drop_adjusted(a0p5_type1err)               + theme(legend.position = "none"),
+  drop_adjusted(a0p5_fdr)                    + theme(legend.position = "none"),
+
+  drop_adjusted(signalAuc_0p5) + labs(tag = "C") + theme(legend.position = "none"),
+  drop_adjusted(batchAuc_0p5)                       + theme(legend.position = "none"),
+  guide_area(),
+
+  ncol = 3,
+  nrow = 3,
+  guides = "collect"
+) &
+  scale_color_discrete(limits = method_names[method_names!="svdx_adjusted"]) &
+  guides(
+    colour = guide_legend(ncol = 2)
+  ) &
+  theme(aspect.ratio = 1, 
+        plot.tag = element_text(face = "bold", size = 20), 
+        text = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 15),
+        strip.text = element_text(size = 15),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10)
+        )
+
+
+
+ggsave(
+  filename = "./batch_overlap_fraction0_svdxK.pdf",
+  plot = plot0 ,
+  device = cairo_pdf,
+  width = 15,
+  height = 10,
+  units = "in"
+)
+ggsave(
+  filename = "./batch_overlap_fraction0p5_svdxK.pdf",
+  plot = plot0p5 ,
+  device = cairo_pdf,
+  width = 15,
+  height = 10,
+  units = "in"
+)
+```
+
+
