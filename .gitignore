@@ -1,0 +1,14 @@
+# Ignore the main R project file
+*.Rproj
+
+# Ignore temporary RStudio user files and history 
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+.DS_Store
+
+~.gitignore
+
+.gitignore
